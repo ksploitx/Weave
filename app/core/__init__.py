@@ -1,5 +1,5 @@
 """core package."""
 
-from app.core.budget_manager import BudgetManager, BudgetExceededError
+from app.core.budget_manager import ContextBudgetManager, BudgetViolationError
 
-__all__ = ["BudgetManager", "BudgetExceededError"]
+__all__ = ["ContextBudgetManager", "BudgetViolationError"]

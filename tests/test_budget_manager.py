@@ -1,186 +1,98 @@
 """
-Tests for BudgetManager.
+Tests for ContextBudgetManager.
 
 Run with:
     pytest tests/test_budget_manager.py -v
 """
 
-import uuid
-
 import pytest
 
-from app.core.budget_manager import BudgetExceededError, BudgetManager
-from app.schemas.context import AgentContext, Message, MessageRole
+from app.core.budget_manager import BudgetViolationError, ContextBudgetManager
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
+class TestCheckBudgetUnderLimit:
+    """1. check_budget returns True when under limit."""
 
-def make_context(budget: int = 1000, used: int = 0) -> AgentContext:
-    ctx = AgentContext(
-        job_id=uuid.uuid4(),
-        agent_name="test-agent",
-        token_budget=budget,
-        tokens_used=used,
-    )
-    return ctx
+    def test_returns_true_when_under_limit(self):
+        mgr = ContextBudgetManager(max_tokens=1000)
+        assert mgr.check_budget("agent-a", tokens_to_add=500) is True
 
-
-# ── estimate_tokens ───────────────────────────────────────────────────────────
-
-class TestEstimateTokens:
-    def test_empty_string_returns_zero(self):
-        manager = BudgetManager()
-        assert manager.estimate_tokens("") == 0
-
-    def test_positive_result_for_nonempty_string(self):
-        manager = BudgetManager()
-        result = manager.estimate_tokens("Hello, world!")
-        assert result >= 1
-
-    def test_longer_text_gives_larger_estimate(self):
-        manager = BudgetManager()
-        short = manager.estimate_tokens("hi")
-        long_ = manager.estimate_tokens("hi " * 100)
-        assert long_ > short
-
-    def test_approximation_within_reasonable_range(self):
-        manager = BudgetManager()
-        # 400 chars ~ 100 tokens at 4 chars/token
-        result = manager.estimate_tokens("a" * 400)
-        assert 80 <= result <= 130
+    def test_returns_true_at_exact_limit(self):
+        mgr = ContextBudgetManager(max_tokens=1000)
+        assert mgr.check_budget("agent-a", tokens_to_add=1000) is True
 
 
-# ── check_budget ──────────────────────────────────────────────────────────────
+class TestCheckBudgetExceedsLimit:
+    """2. check_budget returns False when would exceed."""
 
-class TestCheckBudget:
-    def test_passes_when_tokens_available(self):
-        manager = BudgetManager(max_tokens=1000, reserve_tokens=50)
-        ctx = make_context(budget=1000, used=0)
-        # Should not raise
-        manager.check_budget(ctx, estimated_tokens=900)
+    def test_returns_false_when_over_limit(self):
+        mgr = ContextBudgetManager(max_tokens=1000)
+        assert mgr.check_budget("agent-a", tokens_to_add=1001) is False
 
-    def test_raises_when_exceeds_budget(self):
-        manager = BudgetManager(max_tokens=1000, reserve_tokens=50)
-        ctx = make_context(budget=1000, used=0)
-        with pytest.raises(BudgetExceededError) as exc_info:
-            manager.check_budget(ctx, estimated_tokens=1000)
-        assert exc_info.value.requested == 1000
-
-    def test_raises_when_already_near_limit(self):
-        manager = BudgetManager(max_tokens=1000, reserve_tokens=50)
-        ctx = make_context(budget=1000, used=960)
-        with pytest.raises(BudgetExceededError):
-            manager.check_budget(ctx, estimated_tokens=100)
-
-    def test_reserve_tokens_respected(self):
-        """Even if tokens_used == 0, the reserve must be kept back."""
-        manager = BudgetManager(max_tokens=1000, reserve_tokens=100)
-        ctx = make_context(budget=1000, used=0)
-        with pytest.raises(BudgetExceededError):
-            manager.check_budget(ctx, estimated_tokens=950)
-
-    def test_exact_boundary_allowed(self):
-        """Requesting exactly (budget - reserve - used) tokens should pass."""
-        manager = BudgetManager(max_tokens=1000, reserve_tokens=50)
-        ctx = make_context(budget=1000, used=0)
-        # 1000 - 50 - 0 = 950 available
-        manager.check_budget(ctx, estimated_tokens=950)  # should not raise
+    def test_returns_false_after_partial_usage(self):
+        mgr = ContextBudgetManager(max_tokens=1000)
+        mgr.add_tokens("agent-a", 800)
+        assert mgr.check_budget("agent-a", tokens_to_add=300) is False
 
 
-# ── record_usage ──────────────────────────────────────────────────────────────
+class TestAddTokensRaisesOnOverflow:
+    """3. add_tokens raises BudgetViolationError on overflow."""
 
-class TestRecordUsage:
-    def test_updates_context_tokens_used(self):
-        manager = BudgetManager()
-        ctx = make_context(budget=1000, used=0)
-        total = manager.record_usage(ctx, prompt_tokens=200, completion_tokens=100)
-        assert total == 300
-        assert ctx.tokens_used == 300
+    def test_raises_budget_violation_error(self):
+        mgr = ContextBudgetManager(max_tokens=500)
+        with pytest.raises(BudgetViolationError) as exc_info:
+            mgr.add_tokens("agent-x", 600)
+        assert exc_info.value.agent_id == "agent-x"
+        assert exc_info.value.overflow == 100
 
-    def test_accumulates_across_calls(self):
-        manager = BudgetManager()
-        ctx = make_context(budget=2000, used=0)
-        manager.record_usage(ctx, prompt_tokens=100, completion_tokens=50)
-        manager.record_usage(ctx, prompt_tokens=200, completion_tokens=80)
-        assert ctx.tokens_used == 430
-
-    def test_returns_running_total(self):
-        manager = BudgetManager()
-        ctx = make_context(budget=1000, used=500)
-        returned = manager.record_usage(ctx, prompt_tokens=50, completion_tokens=50)
-        assert returned == 600
-        assert ctx.tokens_used == 600
+    def test_does_not_mutate_used_on_overflow(self):
+        mgr = ContextBudgetManager(max_tokens=500)
+        try:
+            mgr.add_tokens("agent-x", 600)
+        except BudgetViolationError:
+            pass
+        assert mgr.used == 0
 
 
-# ── should_use_fallback ───────────────────────────────────────────────────────
+class TestFlagViolation:
+    """4. flag_violation appends to violations list."""
 
-class TestShouldUseFallback:
-    def test_false_below_threshold(self):
-        manager = BudgetManager()
-        ctx = make_context(budget=1000, used=800)  # 80% — below default 90%
-        assert manager.should_use_fallback(ctx, threshold=0.9) is False
+    def test_appends_violation_dict(self):
+        mgr = ContextBudgetManager(max_tokens=1000)
+        mgr.flag_violation("agent-z", overflow=42)
+        assert len(mgr.violations) == 1
+        v = mgr.violations[0]
+        assert v["agent_id"] == "agent-z"
+        assert v["overflow"] == 42
+        assert v["max_tokens"] == 1000
 
-    def test_true_at_threshold(self):
-        manager = BudgetManager()
-        ctx = make_context(budget=1000, used=900)  # exactly 90%
-        assert manager.should_use_fallback(ctx, threshold=0.9) is True
-
-    def test_true_above_threshold(self):
-        manager = BudgetManager()
-        ctx = make_context(budget=1000, used=999)
-        assert manager.should_use_fallback(ctx, threshold=0.9) is True
-
-    def test_custom_threshold(self):
-        manager = BudgetManager()
-        ctx = make_context(budget=1000, used=600)  # 60%
-        assert manager.should_use_fallback(ctx, threshold=0.5) is True
-        assert manager.should_use_fallback(ctx, threshold=0.7) is False
+    def test_multiple_violations_accumulate(self):
+        mgr = ContextBudgetManager(max_tokens=1000)
+        mgr.flag_violation("a", overflow=10)
+        mgr.flag_violation("b", overflow=20)
+        assert len(mgr.violations) == 2
 
 
-# ── usage_summary ─────────────────────────────────────────────────────────────
+class TestGetSummary:
+    """5. get_summary returns correct structure."""
 
-class TestUsageSummary:
     def test_returns_expected_keys(self):
-        manager = BudgetManager()
-        ctx = make_context(budget=1000, used=250)
-        summary = manager.usage_summary(ctx)
-        for key in (
-            "job_id",
-            "agent_name",
-            "token_budget",
-            "tokens_used",
-            "tokens_remaining",
-            "utilisation_pct",
-            "fallback_triggered",
-        ):
-            assert key in summary, f"Missing key: {key}"
+        mgr = ContextBudgetManager(max_tokens=2000)
+        mgr.add_tokens("agent-1", 300)
+        mgr.add_tokens("agent-2", 200)
+        summary = mgr.get_summary()
 
-    def test_utilisation_pct_calculation(self):
-        manager = BudgetManager()
-        ctx = make_context(budget=1000, used=250)
-        summary = manager.usage_summary(ctx)
-        assert summary["utilisation_pct"] == pytest.approx(25.0, rel=1e-2)
+        assert summary["max"] == 2000
+        assert summary["used"] == 500
+        assert summary["remaining"] == 1500
+        assert summary["by_agent"] == {"agent-1": 300, "agent-2": 200}
 
-    def test_tokens_remaining_consistent(self):
-        manager = BudgetManager()
-        ctx = make_context(budget=1000, used=300)
-        summary = manager.usage_summary(ctx)
-        assert summary["tokens_remaining"] == 700
-
-
-# ── BudgetExceededError ───────────────────────────────────────────────────────
-
-class TestBudgetExceededError:
-    def test_attributes_set_correctly(self):
-        err = BudgetExceededError(requested=500, remaining=100)
-        assert err.requested == 500
-        assert err.remaining == 100
-
-    def test_is_exception(self):
-        err = BudgetExceededError(requested=1, remaining=0)
-        assert isinstance(err, Exception)
-
-    def test_message_contains_numbers(self):
-        err = BudgetExceededError(requested=999, remaining=3)
-        assert "999" in str(err)
-        assert "3" in str(err)
+    def test_empty_manager_summary(self):
+        mgr = ContextBudgetManager(max_tokens=100)
+        summary = mgr.get_summary()
+        assert summary == {
+            "max": 100,
+            "used": 0,
+            "remaining": 100,
+            "by_agent": {},
+        }

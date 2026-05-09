@@ -1,4 +1,4 @@
-"""AgentLog model — per-agent turn record within a job."""
+"""AgentLog model — per-agent event record within a job."""
 
 import uuid
 from datetime import datetime
@@ -12,8 +12,8 @@ from app.database import Base
 
 class AgentLog(Base):
     """
-    Records a single reasoning/action turn taken by an agent.
-    Each agent turn belongs to one Job.
+    Records a single event produced by an agent during a job.
+    Each agent event belongs to one Job.
     """
 
     __tablename__ = "agent_logs"
@@ -27,29 +27,22 @@ class AgentLog(Base):
         nullable=False,
         index=True,
     )
-    agent_name: Mapped[str] = mapped_column(String(128), nullable=False)
-    # Prompt sent to the LLM
-    prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Raw LLM completion text
-    completion: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Model actually used for this turn
-    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    # Token counts returned by the API
-    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    # Optional structured metadata (tool calls, chain-of-thought, etc.)
-    metadata_: Mapped[dict | None] = mapped_column(
-        "metadata", JSONB, nullable=True
-    )
-    created_at: Mapped[datetime] = mapped_column(
+    timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    agent_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    output_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    policy_violation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # Relationships (lazy so async sessions stay explicit)
     job = relationship("Job", lazy="raise", back_populates=None)
 
     def __repr__(self) -> str:  # pragma: no cover
         return (
-            f"<AgentLog id={self.id} agent={self.agent_name} tokens={self.total_tokens}>"
+            f"<AgentLog id={self.id} agent={self.agent_id} event={self.event_type}>"
         )
