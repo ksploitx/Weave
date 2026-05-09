@@ -1,34 +1,119 @@
-# Weave
+<h1 align="center">Weave</h1>
+<p align="center">Real-time multi-agent LLM orchestration system with self-improving eval loop</p>
 
-> Multi-agent LLM orchestration system with self-improving evaluation loop.
-
-Weave decomposes complex queries across specialised AI agents (decomposition, RAG, critique, synthesis), orchestrates them via LangGraph with dynamic routing, streams results over SSE, and continuously improves its own prompts through a 6-dimensional evaluation harness and meta-agent feedback loop.
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white) ![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white) ![LangGraph](https://img.shields.io/badge/LangGraph-0.4-1C3C3C?logo=langchain&logoColor=white) ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?logo=postgresql&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white) ![OpenRouter](https://img.shields.io/badge/OpenRouter-API-6366F1) ![License](https://img.shields.io/badge/License-MIT-green)
 
 ---
 
-## Setup (5 minutes)
+## 🔍 What is Weave
+
+Weave is a multi-agent orchestration system that decomposes complex queries across specialised AI agents, coordinates them via a LangGraph state machine with dynamic routing and token-budget enforcement, and streams every intermediate step to the client over SSE. It continuously improves its own agent prompts through a 6-dimensional evaluation harness that scores 15 test cases, identifies weak dimensions, and proposes targeted prompt rewrites — all under human-in-the-loop review.
+
+---
+
+## 🏗️ Architecture
+
+```
+                          +---------------------------+
+                          |    FastAPI  (port 8000)    |
+  +--------+              |  POST /query (SSE stream)  |            +---------+
+  | Client | ----------> |  GET  /jobs/{id}/trace      | ---------> | Celery  |
+  +--------+              |  POST /eval/run             |            | Worker  |
+                          |  GET  /eval/latest          |            +---------+
+                          |  POST /prompt-rewrites/review|               |
+                          |  POST /eval/re-run-failed   |               |
+                          +-------------+---------------+               |
+                                        |                               |
+                                        v                               |
+                          +----------------------------+                |
+                          |   LangGraph Orchestrator    |                |
+                          |  (StateGraph + dynamic      |                |
+                          |   routing function)         |                |
+                          +--+-----+-----+-----+----+--+                |
+                             |     |     |     |    |                   |
+              +--------------+     |     |     |    +----------+       |
+              v                    v     |     v               v       |
+       +--------------+  +------+ |  +----------+  +-------------+    |
+       | Decomposition|  | RAG  | |  | Critique |  | Compression |    |
+       | budget: 1200 |  | 2000 | |  |   1500   |  |    800      |    |
+       +--------------+  +--+---+ |  +----------+  +-------------+    |
+                            |     |                                    |
+                         +--+--+  |                                    |
+                         |FAISS|  v                                    |
+                         +-----+  +-----------+                        |
+                                  | Synthesis |                        |
+                                  |   1500    |                        |
+                                  +-----------+                        |
+                                        |                              |
+         +------------------------------v----------------------------+ |
+         |                   SharedContext (in-memory)                | |
+         |  sub_tasks | agent_outputs | contradictions | provenance  | |
+         +------+----------+----------+----------+----------+-------+ |
+                |          |          |          |          |           |
+                v          v          v          v          v           v
+          +----------+ +-------+ +-----------+ +-------+ +----------+
+          |PostgreSQL| | Redis | |OpenRouter | | Tools | | Log UI   |
+          | 5 tables | |Celery | |  (LLM)    | |  x4   | | port 8080|
+          +----------+ +-------+ +-----------+ +-------+ +----------+
+```
+
+---
+
+## 🤖 Agents
+
+| Agent | Budget | Role | Writes to context |
+|-------|-------:|------|-------------------|
+| **Decomposition** | 1 200 tok | Breaks query into a SubTask dependency DAG | `sub_tasks[]` |
+| **RAG** | 2 000 tok | Multi-hop FAISS retrieval (15 docs, 2-hop, min 4 chunks) | `agent_outputs["rag"]`, `citations[]` |
+| **Critique** | 1 500 tok | Per-claim confidence scoring, span-level flagging | `contradictions[]`, `flagged_spans[]` |
+| **Synthesis** | 1 500 tok | Resolves contradictions, builds provenance map | `provenance_map`, final answer |
+| **Compression** | 800 tok | Triggered by NeedCompressionError — summarises context | Compressed `agent_outputs` content |
+| **Meta** | 1 000 tok | Analyses eval failures, proposes prompt rewrites | `PromptRewrite` (pending in DB) |
+
+---
+
+## 🔧 Tools
+
+| Tool | Failure modes | Max retries |
+|------|---------------|:-----------:|
+| **web_search** | `timeout`, `empty`, `parse_error` | 2 |
+| **sql_lookup** | `timeout`, `empty`, `parse_error` (blocked DDL/DML) | 2 |
+| **code_sandbox** | `timeout`, `error` (blocked imports: os, sys, subprocess, shutil, pathlib) | 2 |
+| **self_reflection** | `timeout`, `empty`, `error` | 2 |
+
+---
+
+## 🚀 Quick start
 
 ```bash
-git clone <repo>
-cp .env.example .env   # add your OPENROUTER_API_KEY
+git clone https://github.com/KhushneetSingh/Weave.git
+cd Weave
+cp .env.example .env
+# add your OPENROUTER_API_KEY to .env
 docker compose up
 ```
 
-That's it. All 4 services start automatically:
-- **API** — `localhost:8000` (FastAPI + Swagger at `/docs`)
-- **Worker** — Celery background tasks (eval runs, meta-agent)
-- **Database** — PostgreSQL 15
-- **Log UI** — `localhost:8080` (trace viewer)
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/query` | Run the multi-agent pipeline. Returns SSE stream. |
+| `GET` | `/jobs/{job_id}/trace` | Ordered event trace (agent + tool logs) for a job. |
+| `POST` | `/eval/run` | Start a 15-case evaluation run via Celery. |
+| `GET` | `/eval/latest` | Latest eval results grouped by category + dimension. |
+| `POST` | `/prompt-rewrites/{id}/review` | Approve or reject a pending prompt rewrite. |
+| `POST` | `/eval/re-run-failed` | Re-run only previously failed eval cases. |
+| `GET` | `/health` | Liveness probe — returns `{"status": "ok"}`. |
 
 ---
 
-## Environment Variables
+## 🌍 Environment variables
 
 | Variable | Required | Default | Description |
-|---|---|---|---|
+|----------|:--------:|---------|-------------|
 | `OPENROUTER_API_KEY` | **Yes** | — | Your OpenRouter API key |
 | `OPENROUTER_MODEL` | No | `meta-llama/llama-3.1-8b-instruct:free` | Primary LLM model |
-| `OPENROUTER_FALLBACK_MODEL` | No | `mistralai/mistral-7b-instruct:free` | Fallback model if primary fails |
+| `OPENROUTER_FALLBACK_MODEL` | No | `mistralai/mistral-7b-instruct:free` | Fallback if primary fails |
 | `POSTGRES_USER` | No | `megaai` | Postgres username |
 | `POSTGRES_PASSWORD` | No | `megaai` | Postgres password |
 | `POSTGRES_DB` | No | `megaai` | Postgres database name |
@@ -40,260 +125,131 @@ That's it. All 4 services start automatically:
 
 ---
 
-## Architecture
+## 📊 Eval pipeline
 
-```
-                          ┌─────────────────────────────────────────┐
-                          │              FastAPI (8000)              │
-                          │   POST /query  → SSE stream             │
-                          │   GET  /jobs/{id}/trace                 │
-                          │   GET  /eval/latest                     │
-                          │   POST /eval/run                        │
-                          │   POST /prompt-rewrites/{id}/review     │
-                          │   POST /eval/re-run-failed              │
-                          └────────────────┬────────────────────────┘
-                                           │
-                                           ▼
-                          ┌─────────────────────────────────────────┐
-                          │         LangGraph Orchestrator           │
-                          │   (StateGraph with dynamic routing)      │
-                          └─────┬──────┬──────┬──────┬──────┬───────┘
-                                │      │      │      │      │
-                     ┌──────────┘      │      │      │      └──────────┐
-                     ▼                 ▼      │      ▼                 ▼
-              ┌─────────────┐  ┌──────────┐   │  ┌──────────┐  ┌─────────────┐
-              │Decomposition│  │   RAG    │   │  │ Critique │  │ Compression │
-              │   Agent     │  │  Agent   │   │  │  Agent   │  │   Agent     │
-              │ budget:1200 │  │budget:2000│  │  │budget:1500│  │ budget:800  │
-              └──────┬──────┘  └────┬─────┘   │  └────┬─────┘  └─────────────┘
-                     │              │         │       │
-                     │              ▼         │       │
-                     │         ┌─────────┐    │       │
-                     │         │  FAISS  │    │       │
-                     │         │  Index  │    │       │
-                     │         └─────────┘    │       │
-                     │                        ▼       │
-                     │                 ┌──────────┐   │
-                     │                 │Synthesis │   │
-                     │                 │  Agent   │   │
-                     │                 │budget:1500│  │
-                     │                 └──────────┘   │
-                     │                                │
-                     └────────────┬───────────────────┘
-                                  ▼
-                          ┌──────────────┐       ┌────────────────┐
-                          │SharedContext │──────▶│   PostgreSQL   │
-                          │ (in-memory)  │       │  (Jobs, Logs,  │
-                          └──────────────┘       │  EvalRuns,     │
-                                                 │  Rewrites)     │
-                                                 └────────────────┘
-```
+The evaluation harness runs 15 test cases through the full orchestration pipeline and scores each across 6 dimensions.
 
-### Tools
+| Category | Cases | What's tested |
+|----------|:-----:|---------------|
+| **Baseline** | 5 | Known correct answers — factual recall |
+| **Ambiguous** | 5 | Underspecified inputs — tests decomposition quality |
+| **Adversarial** | 5 | Prompt injections, wrong premises, forced contradictions |
 
-Each agent can invoke tools via the tool framework (`app/tools/`):
-- **web_search** — Simulated web search with retry + timeout
-- **sql_lookup** — Database query execution
-- **code_sandbox** — Python code execution (NOT sandboxed — see limitations)
-- **self_reflection** — Agent self-evaluation
+**6 scoring dimensions:**
+
+- 📝 **answer_correctness** — does the final output match the expected answer?
+- 📎 **citation_accuracy** — are RAG citations valid and grounded in retrieved chunks?
+- ⚔️ **contradiction_resolution** — were flagged contradictions resolved by synthesis?
+- ⚡ **tool_efficiency** — were tool calls appropriate for the case type?
+- 💰 **budget_compliance** — did agents stay within token budget?
+- 🤝 **critique_agreement** — did synthesis honour critique feedback?
 
 ---
 
-## Agents
+## 🔄 Self-improving loop
 
-| Agent | What it does | Reads from SharedContext | Writes to SharedContext | Token Budget |
-|---|---|---|---|---|
-| **Decomposition** | Breaks query into a SubTask dependency graph | `query` | `sub_tasks` | 1200 |
-| **RAG** | Multi-hop retrieval from FAISS index (15 AI-topic docs, 2-hop, min 4 chunks) | `query`, `sub_tasks` | `agent_outputs["rag"]` with citations | 2000 |
-| **Critique** | Per-claim confidence scoring and span-level flagging of other agent outputs | `agent_outputs` | `contradictions`, `agent_outputs["critique"]` with flagged spans | 1500 |
-| **Synthesis** | Resolves contradictions, builds provenance map, produces final answer | `agent_outputs`, `contradictions`, `sub_tasks` | `provenance_map`, `agent_outputs["synthesis"]` | 1500 |
-| **Compression** | Triggered on NeedCompressionError — summarises context to free budget | `agent_outputs` | Compressed `agent_outputs` content | 800 |
-
----
-
-## Self-Improving Loop
-
-### What it does
-After each evaluation run, the **MetaAgent** reads failure data, identifies the worst-performing scoring dimension, maps it to the responsible agent, and uses the LLM to propose a system prompt rewrite. The rewrite is stored with status `"pending"` in the database.
-
-### What it does NOT do
-- **Auto-apply rewrites** — every rewrite requires explicit human approval
-- **Guarantee improvement** — LLM-generated prompts are plausible but not guaranteed to help
-- **Work without human review** — the loop is intentionally human-in-the-loop
-
-### How to trigger
-```bash
-# 1. Run eval
-curl -X POST http://localhost:8000/eval/run
-
-# 2. Wait for completion, then check results
-curl http://localhost:8000/eval/latest
-
-# 3. The meta-agent will have created a prompt rewrite (if scores < 0.7)
-#    Review and approve/reject it:
-curl -X POST http://localhost:8000/prompt-rewrites/{rewrite_id}/review \
-  -H "Content-Type: application/json" \
-  -d '{"decision": "approve", "reviewer_note": "Looks good"}'
-
-# 4. Approving triggers a re-eval automatically
-```
+1. `POST /eval/run` → runs all 15 cases through the pipeline
+2. Each case is scored across 6 dimensions and stored as an `EvalRun` in Postgres
+3. **Meta-agent** reads failures → finds the worst dimension → identifies the responsible agent
+4. Meta-agent calls the LLM to propose a `PromptRewrite` with unified diff + justification
+5. Human reviews → `POST /prompt-rewrites/{id}/review` with `approve` or `reject`
+6. If approved → agent's `system_prompt` is patched in memory → targeted re-eval on failed cases only
+7. Delta stored in DB for tracking improvement over time
 
 ---
 
-## Known Limitations
+## ⚠️ Known limitations
 
-- **OpenRouter free models** (llama-3.1-8b) are much weaker than GPT-4 — citation quality suffers
-- **FAISS in-memory**: restarts lose the index (fix: persist to disk or use pgvector)
-- **Code sandbox is NOT truly isolated** (no container, no seccomp)
-- **Eval scoring is heuristic** for ambiguous/adversarial cases — not ground truth
-- **Meta-agent prompt improvement is LLM-generated**: plausible but not guaranteed to help
-- **No auth on any endpoint**
-
----
-
-## What I'd Build Next
-
-- Replace FAISS with **pgvector** for persistence
-- Add proper **code sandbox** (gVisor or Firecracker)
-- Add **human-in-the-loop UI** for reviewing rewrites
-- Add **token streaming from OpenRouter** (currently batched per agent)
-- Add **prompt injection detection** layer before orchestrator
+- **OpenRouter free-tier models** (Llama 3.1 8B) are significantly weaker than GPT-4 — citation quality and adversarial robustness suffer
+- **FAISS index is in-memory only** — restarts lose the index; no persistence to disk or pgvector
+- **Code sandbox is NOT truly isolated** — runs `subprocess.run(["python3", "-c", code])` with no container, no seccomp, no gVisor
+- **Eval scoring is heuristic** for ambiguous/adversarial cases — keyword matching, not ground-truth comparison
+- **Meta-agent prompt rewrites are LLM-generated** — plausible but not guaranteed to improve scores
+- **No authentication on any endpoint** — all routes are publicly accessible
+- **`.env.example` defaults** (`megaai`) don't match `config.py` defaults (`weave`) — can cause confusion on first setup without Docker
+- **No rate limiting** on the API — a flood of `/query` requests will exhaust LLM budget
 
 ---
 
-## API Reference
+## 🔮 What's next
 
-### `POST /query` — Run orchestration pipeline
-
-```bash
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "What is RAG?", "max_budget": 4000}' \
-  --no-buffer
-```
-
-Returns an SSE stream with event types: `job_created`, `agent_start`, `token`, `tool_call`, `tool_result`, `routing`, `budget_update`, `done`, `error`.
+- 🔀 Replace FAISS with **pgvector** for persistent vector storage across restarts
+- 🔒 Add a proper **code sandbox** via gVisor or Firecracker microVMs
+- 🖥️ Build a **web UI** for reviewing prompt rewrites and browsing eval results
+- 🛡️ Add a **prompt injection detection** layer before the orchestrator
+- 📈 Implement **weighted dimension scoring** with configurable weights per use case
 
 ---
 
-### `GET /jobs/{job_id}/trace` — Get ordered event trace
+## 📁 Project structure
 
-```bash
-curl http://localhost:8000/jobs/<job_id>/trace
 ```
-
-Response:
-```json
-{
-  "job_id": "uuid",
-  "query": "What is RAG?",
-  "status": "completed",
-  "total_latency_ms": 1234.5,
-  "total_tokens": 850,
-  "events": [
-    {
-      "timestamp": "2026-05-09T12:00:00+00:00",
-      "event_type": "agent_run",
-      "agent_id": "decomposition",
-      "details": {"latency_ms": 200, "token_count": 150}
-    }
-  ]
-}
+Weave/
+├── app/
+│   ├── __init__.py
+│   ├── config.py                # Settings from env (pydantic-settings)
+│   ├── database.py              # SQLAlchemy async engine + session + Base
+│   ├── main.py                  # FastAPI app — all endpoints + error handling
+│   ├── agents/
+│   │   ├── __init__.py          # Re-exports all agents
+│   │   ├── base.py              # BaseAgent ABC — budget, LLM, logging
+│   │   ├── decomposition.py     # Query → SubTask DAG
+│   │   ├── rag.py               # Multi-hop FAISS retrieval + citations
+│   │   ├── critique.py          # Per-claim confidence + span flagging
+│   │   ├── synthesis.py         # Contradiction resolution + provenance
+│   │   ├── compression.py       # Context compression on budget overflow
+│   │   └── meta.py              # Eval failure analysis → prompt rewrites
+│   ├── core/
+│   │   ├── __init__.py          # Re-exports BudgetManager
+│   │   ├── budget_manager.py    # Token budget enforcement
+│   │   ├── llm.py               # OpenRouter async client with fallback
+│   │   ├── logger.py            # structlog JSON logging + DB persistence
+│   │   └── orchestrator.py      # LangGraph StateGraph with dynamic routing
+│   ├── eval/
+│   │   ├── __init__.py
+│   │   ├── harness.py           # Runs test cases through pipeline + scores
+│   │   ├── scorer.py            # 6-dimension hand-rolled scorer
+│   │   └── test_cases.py        # 15 eval cases (baseline/ambiguous/adversarial)
+│   ├── models/
+│   │   ├── __init__.py          # Re-exports all ORM models for Alembic
+│   │   ├── job.py               # Job ORM model
+│   │   ├── agent_log.py         # AgentLog ORM model
+│   │   ├── tool_log.py          # ToolLog ORM model
+│   │   ├── eval_run.py          # EvalRun ORM model
+│   │   └── prompt_rewrite.py    # PromptRewrite ORM model
+│   ├── schemas/
+│   │   ├── __init__.py          # Re-exports all Pydantic schemas
+│   │   ├── context.py           # SharedContext, AgentOutput, SubTask, etc.
+│   │   ├── eval.py              # EvalScore, ScoredDimension, PromptRewrite
+│   │   └── tools.py             # ToolResult schema
+│   ├── tools/
+│   │   ├── __init__.py          # TOOL_REGISTRY + re-exports
+│   │   ├── base.py              # BaseTool ABC — timeout, retry, logging
+│   │   ├── web_search.py        # Simulated web search (fake results)
+│   │   ├── sql_lookup.py        # NL → SQL via LLM → asyncpg execution
+│   │   ├── code_sandbox.py      # Python subprocess sandbox
+│   │   └── self_reflection.py   # Contradiction detection via LLM
+│   └── worker/
+│       ├── __init__.py          # Celery app configuration
+│       └── tasks.py             # Background tasks (eval, meta-agent)
+├── alembic/
+│   ├── env.py                   # Async Alembic configuration
+│   ├── script.py.mako           # Migration template
+│   └── versions/
+│       ├── 0001_initial.py      # Creates 5 core tables
+│       └── 0002_seed_products_orders.py  # products + orders for sql_lookup
+├── log_ui/
+│   ├── __init__.py
+│   └── main.py                  # Standalone FastAPI log viewer (port 8080)
+├── tests/
+│   ├── __init__.py
+│   └── test_budget_manager.py   # 10 tests for ContextBudgetManager
+├── archon_viz.py                # Terminal architecture visualizer (rich + networkx)
+├── docker-compose.yml           # 5 services: db, redis, api, worker, log_ui
+├── Dockerfile                   # Python 3.11-slim
+├── requirements.txt
+├── alembic.ini
+├── pytest.ini
+├── .env.example
+└── .gitignore
 ```
-
----
-
-### `POST /eval/run` — Start evaluation run
-
-```bash
-curl -X POST http://localhost:8000/eval/run \
-  -H "Content-Type: application/json" \
-  -d '{"case_ids": null}'
-```
-
-Response:
-```json
-{"run_id": "celery-task-id", "status": "started", "case_count": 15}
-```
-
----
-
-### `GET /eval/latest` — Get latest eval results
-
-```bash
-curl http://localhost:8000/eval/latest
-```
-
-Response:
-```json
-{
-  "run_id": "uuid",
-  "timestamp": "2026-05-09T12:00:00+00:00",
-  "total_cases": 15,
-  "by_category": {
-    "baseline": {"avg_score": 0.75, "cases": [...]},
-    "ambiguous": {"avg_score": 0.65, "cases": [...]},
-    "adversarial": {"avg_score": 0.55, "cases": [...]}
-  },
-  "by_dimension": {
-    "answer_correctness": {"avg": 0.7, "min": 0.4, "max": 1.0},
-    "citation_accuracy": {"avg": 0.6, "min": 0.3, "max": 0.9}
-  },
-  "delta_vs_previous": {"overall": 0.05, "by_dimension": {...}}
-}
-```
-
----
-
-### `POST /prompt-rewrites/{id}/review` — Approve/reject a rewrite
-
-```bash
-curl -X POST http://localhost:8000/prompt-rewrites/<rewrite_id>/review \
-  -H "Content-Type: application/json" \
-  -d '{"decision": "approve", "reviewer_note": "LGTM"}'
-```
-
-Response:
-```json
-{
-  "rewrite_id": "uuid",
-  "decision": "approve",
-  "timestamp": "2026-05-09T12:00:00+00:00",
-  "re_eval_triggered": true
-}
-```
-
----
-
-### `POST /eval/re-run-failed` — Re-run failed eval cases
-
-```bash
-curl -X POST http://localhost:8000/eval/re-run-failed \
-  -H "Content-Type: application/json" \
-  -d '{"use_approved_prompts": true}'
-```
-
-Response:
-```json
-{
-  "new_run_id": "celery-task-id",
-  "cases_rerun": 3,
-  "performance_delta": {}
-}
-```
-
----
-
-## Error Responses
-
-All errors follow this schema:
-
-```json
-{
-  "error_code": "JOB_NOT_FOUND",
-  "message": "No job with that ID",
-  "job_id": "uuid-or-null"
-}
-```
-
-Error codes: `JOB_NOT_FOUND`, `EVAL_NOT_FOUND`, `REWRITE_NOT_FOUND`, `REWRITE_ALREADY_REVIEWED`, `BUDGET_EXCEEDED`, `LLM_UNAVAILABLE`, `TOOL_FAILED`, `INVALID_INPUT`.
