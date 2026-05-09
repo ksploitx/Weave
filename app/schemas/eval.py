@@ -1,48 +1,57 @@
-"""Schemas for evaluation requests and responses."""
+"""Schemas for evaluation scoring and prompt-rewrite tracking."""
 
 from __future__ import annotations
 
-import uuid
-from typing import Any
+from typing import Literal
 
-from pydantic import BaseModel, Field
-
-from app.models.eval_run import EvalStatus
+from pydantic import BaseModel
 
 
-class EvalCriteria(BaseModel):
-    """A single named criterion used by an evaluator."""
+class ScoredDimension(BaseModel):
+    """A single evaluation dimension with a normalised score and rationale."""
 
-    name: str
-    description: str
-    weight: float = Field(default=1.0, ge=0.0, le=1.0)
+    score: float  # 0.0 to 1.0
+    justification: str
 
 
-class EvalRequest(BaseModel):
+class EvalScore(BaseModel):
     """
-    Payload submitted to an evaluator agent.
-    Contains the original task, the agent's response, and any criteria to score against.
+    Multi-dimensional evaluation result for a single test case.
+
+    Six orthogonal dimensions are scored independently; the ``total``
+    property returns the unweighted mean.
     """
 
-    job_id: uuid.UUID
-    evaluator_name: str
-    task_description: str
-    agent_response: str
-    criteria: list[EvalCriteria] = Field(default_factory=list)
-    # Additional context the evaluator may need
-    context: dict[str, Any] = Field(default_factory=dict)
+    case_id: str
+    case_type: Literal["baseline", "ambiguous", "adversarial"]
+    answer_correctness: ScoredDimension
+    citation_accuracy: ScoredDimension
+    contradiction_resolution: ScoredDimension
+    tool_efficiency: ScoredDimension
+    budget_compliance: ScoredDimension
+    critique_agreement: ScoredDimension
+
+    @property
+    def total(self) -> float:
+        dims = [
+            self.answer_correctness,
+            self.citation_accuracy,
+            self.contradiction_resolution,
+            self.tool_efficiency,
+            self.budget_compliance,
+            self.critique_agreement,
+        ]
+        return sum(d.score for d in dims) / len(dims)
 
 
-class EvalResponse(BaseModel):
-    """
-    Structured result returned by an evaluator.
-    Maps 1-to-1 to an EvalRun DB row.
-    """
+class PromptRewrite(BaseModel):
+    """Tracks a proposed prompt mutation produced by the self-optimiser."""
 
-    job_id: uuid.UUID
-    evaluator_name: str
-    status: EvalStatus
-    score: float | None = Field(default=None, ge=0.0, le=1.0)
-    rationale: str | None = None
-    # Per-criterion breakdown scores
-    metrics: dict[str, float] = Field(default_factory=dict)
+    id: str
+    target_agent: str
+    target_dimension: str
+    old_prompt: str
+    new_prompt: str
+    diff: str
+    justification: str
+    status: Literal["pending", "approved", "rejected"] = "pending"

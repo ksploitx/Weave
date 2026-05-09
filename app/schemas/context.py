@@ -1,66 +1,88 @@
-"""Schemas for the shared agent context / conversation window."""
+"""Schemas for the shared orchestration context passed between agents."""
 
 from __future__ import annotations
 
-import enum
-import uuid
-from typing import Any
+from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, Field
-
-
-class MessageRole(str, enum.Enum):
-    SYSTEM = "system"
-    USER = "user"
-    ASSISTANT = "assistant"
-    TOOL = "tool"
+from pydantic import BaseModel
 
 
-class Message(BaseModel):
-    """A single message in an agent's conversation history."""
+class SubTask(BaseModel):
+    """A decomposed unit of work within a job."""
 
-    role: MessageRole
+    id: str
+    description: str
+    task_type: str
+    dependencies: list[str] = []
+    status: Literal["pending", "running", "done", "blocked"] = "pending"
+    output: str | None = None
+
+
+class Citation(BaseModel):
+    """Links a textual claim back to the source chunks that support it."""
+
+    claim: str
+    chunk_ids: list[str]
+    agent_id: str
+
+
+class FlaggedSpan(BaseModel):
+    """A span of text flagged by a critic agent for revision."""
+
+    span: str  # exact text from another agent's output
+    reason: str
+    suggested: str
+    confidence: float
+
+
+class Contradiction(BaseModel):
+    """Records a detected contradiction between two agent outputs."""
+
+    agent_a: str
+    agent_b: str
+    claim_a: str
+    claim_b: str
+    conflict_description: str
+    resolved: bool = False
+    resolution: str | None = None
+
+
+class RoutingDecision(BaseModel):
+    """An entry in the routing log that records why a job was sent to an agent."""
+
+    from_agent: str | None
+    to_agent: str
+    justification: str
+    timestamp: datetime
+
+
+class AgentOutput(BaseModel):
+    """The structured output produced by a single agent turn."""
+
+    agent_id: str
     content: str
-    # Optional name (used for tool-result messages)
-    name: str | None = None
-    # Token count — populated after estimation / API response
+    confidence: float = 1.0
+    citations: list[Citation] = []
+    flagged_spans: list[FlaggedSpan] = []
     token_count: int = 0
+    latency_ms: float = 0.0
 
-    model_config = {"use_enum_values": True}
 
-
-class AgentContext(BaseModel):
+class SharedContext(BaseModel):
     """
-    The complete context window passed to an agent on each turn.
+    The single source of truth for a running job.
 
-    Tracks the running token total so BudgetManager can gate each call.
+    Every agent reads from and writes to this context so the orchestrator
+    can track provenance, budget, contradictions, and routing decisions.
     """
 
-    job_id: uuid.UUID
-    agent_name: str
-    messages: list[Message] = Field(default_factory=list)
-    # Soft limit — enforced by BudgetManager before each LLM call
-    token_budget: int = 4000
-    # Running total updated by BudgetManager after each successful call
-    tokens_used: int = 0
-    # Arbitrary key-value metadata agents can attach (e.g. task description)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    @property
-    def tokens_remaining(self) -> int:
-        return max(0, self.token_budget - self.tokens_used)
-
-    def add_message(self, message: Message) -> None:
-        """Append a message and update the running token total."""
-        self.messages.append(message)
-        self.tokens_used += message.token_count
-
-    def to_openai_messages(self) -> list[dict[str, str]]:
-        """Serialise messages to the format expected by the OpenAI-compatible API."""
-        result = []
-        for msg in self.messages:
-            entry: dict[str, str] = {"role": msg.role, "content": msg.content}
-            if msg.name:
-                entry["name"] = msg.name
-            result.append(entry)
-        return result
+    job_id: str
+    query: str
+    sub_tasks: list[SubTask] = []
+    agent_outputs: dict[str, AgentOutput] = {}
+    tool_calls: list[dict] = []
+    contradictions: list[Contradiction] = []
+    provenance_map: dict[str, str] = {}
+    budget_violations: list[str] = []
+    routing_log: list[RoutingDecision] = []

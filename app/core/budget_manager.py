@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from app.schemas.context import AgentContext
+from app.schemas.context import SharedContext
 
 logger = logging.getLogger(__name__)
 
@@ -37,20 +37,31 @@ class BudgetExceededError(Exception):
 @dataclass
 class BudgetManager:
     """
-    Stateless helper that operates on an :class:`AgentContext`.
+    Token-budget gatekeeper that operates on a :class:`SharedContext`.
+
+    Derives total usage from the ``token_count`` fields recorded in each
+    :class:`AgentOutput` stored in ``context.agent_outputs``.  Violations
+    are appended to ``context.budget_violations`` for audit.
 
     Usage::
 
         manager = BudgetManager(max_tokens=4000)
-        manager.check_budget(context, estimated_tokens=200)   # raises if over
+        manager.check_budget(context, agent_id="researcher", estimated_tokens=200)
         # … make LLM call …
-        manager.record_usage(context, prompt_tokens=180, completion_tokens=120)
+        manager.record_usage(context, agent_id="researcher",
+                             prompt_tokens=180, completion_tokens=120)
     """
 
     max_tokens: int = 4000
     # Minimum tokens that must remain before a call is allowed.
     reserve_tokens: int = 50
     _fallback_triggered: bool = field(default=False, init=False, repr=False)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _total_tokens_used(self, context: SharedContext) -> int:
+        """Sum ``token_count`` across all agent outputs in the context."""
+        return sum(ao.token_count for ao in context.agent_outputs.values())
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -65,88 +76,102 @@ class BudgetManager:
             return 0
         return max(1, int(len(text) / _CHARS_PER_TOKEN))
 
-    def check_budget(self, context: AgentContext, estimated_tokens: int) -> None:
+    def check_budget(
+        self,
+        context: SharedContext,
+        agent_id: str,
+        estimated_tokens: int,
+    ) -> None:
         """
-        Assert the context has enough headroom for *estimated_tokens* more tokens.
+        Assert the context has enough headroom for *estimated_tokens* more.
 
         Raises :class:`BudgetExceededError` if the call would exceed the budget.
+        A human-readable message is also appended to ``context.budget_violations``.
         """
-        effective_limit = context.token_budget - self.reserve_tokens
-        available = effective_limit - context.tokens_used
+        tokens_used = self._total_tokens_used(context)
+        effective_limit = self.max_tokens - self.reserve_tokens
+        available = effective_limit - tokens_used
         if estimated_tokens > available:
-            logger.warning(
-                "Budget check failed for agent=%s job=%s: "
-                "requested=%d available=%d budget=%d used=%d",
-                context.agent_name,
-                context.job_id,
-                estimated_tokens,
-                available,
-                context.token_budget,
-                context.tokens_used,
+            violation = (
+                f"agent={agent_id} job={context.job_id}: "
+                f"requested {estimated_tokens}, only {available} remaining "
+                f"(budget={self.max_tokens}, used={tokens_used})"
             )
-            raise BudgetExceededError(requested=estimated_tokens, remaining=available)
+            context.budget_violations.append(violation)
+            logger.warning("Budget check failed — %s", violation)
+            raise BudgetExceededError(
+                requested=estimated_tokens, remaining=available
+            )
 
         logger.debug(
             "Budget OK for agent=%s: requested=%d available=%d",
-            context.agent_name,
+            agent_id,
             estimated_tokens,
             available,
         )
 
     def record_usage(
         self,
-        context: AgentContext,
+        context: SharedContext,
+        agent_id: str,
         prompt_tokens: int,
         completion_tokens: int,
     ) -> int:
         """
-        Update *context.tokens_used* with actual token counts from the API response.
+        Update the ``token_count`` on the agent's output entry.
 
-        Returns the new running total.
+        If *agent_id* already has an :class:`AgentOutput` in the context,
+        its ``token_count`` is incremented.  Returns the new job-wide total.
         """
         total = prompt_tokens + completion_tokens
-        context.tokens_used += total
+        if agent_id in context.agent_outputs:
+            context.agent_outputs[agent_id].token_count += total
+
+        new_total = self._total_tokens_used(context)
         logger.info(
             "Tokens used — agent=%s job=%s prompt=%d completion=%d total_so_far=%d/%d",
-            context.agent_name,
+            agent_id,
             context.job_id,
             prompt_tokens,
             completion_tokens,
-            context.tokens_used,
-            context.token_budget,
+            new_total,
+            self.max_tokens,
         )
-        return context.tokens_used
+        return new_total
 
-    def should_use_fallback(self, context: AgentContext, threshold: float = 0.9) -> bool:
+    def should_use_fallback(
+        self, context: SharedContext, threshold: float = 0.9
+    ) -> bool:
         """
         Return *True* when token usage exceeds *threshold* fraction of the budget.
 
         Callers can use this to swap to the cheaper/smaller fallback model
         before hitting the hard limit.
         """
-        ratio = context.tokens_used / max(context.token_budget, 1)
+        tokens_used = self._total_tokens_used(context)
+        ratio = tokens_used / max(self.max_tokens, 1)
         if ratio >= threshold:
             if not self._fallback_triggered:
                 logger.warning(
-                    "Fallback threshold reached (%.0f%%) for agent=%s job=%s",
+                    "Fallback threshold reached (%.0f%%) for job=%s",
                     ratio * 100,
-                    context.agent_name,
                     context.job_id,
                 )
                 self._fallback_triggered = True
             return True
         return False
 
-    def usage_summary(self, context: AgentContext) -> dict:
+    def usage_summary(self, context: SharedContext) -> dict:
         """Return a JSON-serialisable summary of the current budget state."""
+        tokens_used = self._total_tokens_used(context)
         return {
-            "job_id": str(context.job_id),
-            "agent_name": context.agent_name,
-            "token_budget": context.token_budget,
-            "tokens_used": context.tokens_used,
-            "tokens_remaining": context.tokens_remaining,
+            "job_id": context.job_id,
+            "max_tokens": self.max_tokens,
+            "tokens_used": tokens_used,
+            "tokens_remaining": max(0, self.max_tokens - tokens_used),
             "utilisation_pct": round(
-                context.tokens_used / max(context.token_budget, 1) * 100, 2
+                tokens_used / max(self.max_tokens, 1) * 100, 2
             ),
             "fallback_triggered": self._fallback_triggered,
+            "violation_count": len(context.budget_violations),
         }
