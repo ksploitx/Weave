@@ -184,3 +184,237 @@ async def _update_job_status(
             await session.commit()
     except Exception as exc:
         logger.error("Failed to update job status: %s", exc)
+
+
+# ── Eval / Meta-agent request schemas ─────────────────────────────────────────
+
+class EvalRunRequest(BaseModel):
+    case_ids: list[str] | None = None
+
+
+class PromptReviewRequest(BaseModel):
+    decision: str  # "approve" | "reject"
+    reviewer_note: str = ""
+
+
+class ReRunFailedRequest(BaseModel):
+    use_approved_prompts: bool = True
+
+
+# ── POST /eval/run ────────────────────────────────────────────────────────────
+
+@app.post("/eval/run", tags=["eval"])
+async def eval_run(body: EvalRunRequest = EvalRunRequest()):
+    """
+    Start an evaluation run as a Celery background task.
+    Returns immediately with a run_id.
+    """
+    from app.worker.tasks import run_eval_task
+
+    run_type = "targeted" if body.case_ids else "full"
+    case_count = len(body.case_ids) if body.case_ids else 15
+
+    task = run_eval_task.delay(
+        run_type=run_type,
+        case_ids=body.case_ids,
+    )
+
+    return {
+        "run_id": task.id,
+        "status": "started",
+        "case_count": case_count,
+    }
+
+
+# ── GET /eval/latest ──────────────────────────────────────────────────────────
+
+@app.get("/eval/latest", tags=["eval"])
+async def eval_latest():
+    """Return the latest eval run summary grouped by category + dimension."""
+    from app.eval.harness import EvalHarness
+
+    harness = EvalHarness()
+    return await harness.get_latest_summary()
+
+
+# ── POST /prompt-rewrites/{rewrite_id}/review ─────────────────────────────────
+
+@app.post("/prompt-rewrites/{rewrite_id}/review", tags=["eval"])
+async def review_prompt_rewrite(rewrite_id: str, body: PromptReviewRequest):
+    """
+    Approve or reject a pending prompt rewrite.
+
+    If approved:
+      - Updates PromptRewriteModel.status to "approved"
+      - Patches the target agent's system_prompt in memory
+      - Triggers re-eval on previously failed cases via Celery
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select, update
+
+    from app.database import AsyncSessionLocal
+    from app.models.prompt_rewrite import PromptRewrite as PromptRewriteModel
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(PromptRewriteModel).where(
+                PromptRewriteModel.id == uuid.UUID(rewrite_id)
+            )
+        )
+        rewrite = result.scalar_one_or_none()
+
+    if not rewrite:
+        return {"error": f"Rewrite {rewrite_id} not found."}, 404
+
+    now = datetime.now(timezone.utc)
+    re_eval_triggered = False
+
+    if body.decision == "approve":
+        # 1. Update DB status
+        async with AsyncSessionLocal() as session:
+            stmt = (
+                update(PromptRewriteModel)
+                .where(PromptRewriteModel.id == uuid.UUID(rewrite_id))
+                .values(
+                    status="approved",
+                    reviewer_note=body.reviewer_note,
+                    approved_at=now,
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+        # 2. Patch agent's system_prompt in memory
+        _patch_agent_prompt(rewrite.target_agent, rewrite.new_prompt)
+
+        # 3. Trigger re-eval on failed cases
+        from app.worker.tasks import run_eval_task
+
+        # Find the eval run associated with this rewrite to get failed cases
+        run_eval_task.delay(run_type="full")
+        re_eval_triggered = True
+
+        logger.info(
+            "Prompt rewrite %s approved for agent=%s. Re-eval triggered.",
+            rewrite_id, rewrite.target_agent,
+        )
+
+    elif body.decision == "reject":
+        async with AsyncSessionLocal() as session:
+            stmt = (
+                update(PromptRewriteModel)
+                .where(PromptRewriteModel.id == uuid.UUID(rewrite_id))
+                .values(
+                    status="rejected",
+                    reviewer_note=body.reviewer_note,
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+        logger.info("Prompt rewrite %s rejected.", rewrite_id)
+
+    return {
+        "rewrite_id": rewrite_id,
+        "decision": body.decision,
+        "timestamp": now.isoformat(),
+        "re_eval_triggered": re_eval_triggered,
+    }
+
+
+# ── POST /eval/re-run-failed ─────────────────────────────────────────────────
+
+@app.post("/eval/re-run-failed", tags=["eval"])
+async def eval_rerun_failed(body: ReRunFailedRequest = ReRunFailedRequest()):
+    """
+    Re-run evaluation on previously failed cases.
+    Optionally uses approved prompt rewrites.
+    """
+    from sqlalchemy import desc, select
+
+    from app.database import AsyncSessionLocal
+    from app.eval.harness import EvalHarness
+    from app.models.eval_run import EvalRun
+
+    # Find the latest run
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(EvalRun).order_by(desc(EvalRun.timestamp)).limit(1)
+        )
+        latest = result.scalar_one_or_none()
+
+    if not latest:
+        return {"error": "No previous eval runs found."}
+
+    # If use_approved_prompts, apply any approved rewrites first
+    if body.use_approved_prompts:
+        await _apply_approved_rewrites()
+
+    # Run failed cases via Celery
+    from app.worker.tasks import run_eval_task
+
+    task = run_eval_task.delay(
+        run_type="targeted",
+        previous_run_id=str(latest.id),
+    )
+
+    # Count failed cases
+    harness = EvalHarness()
+    failed_count = 0
+    if latest.scores:
+        for entry in latest.scores:
+            total = harness._compute_total(entry)
+            if total < 0.6:
+                failed_count += 1
+
+    return {
+        "new_run_id": task.id,
+        "cases_rerun": failed_count,
+        "performance_delta": latest.delta or {},
+    }
+
+
+# ── Helpers for prompt patching ───────────────────────────────────────────────
+
+def _patch_agent_prompt(agent_id: str, new_prompt: str) -> None:
+    """Patch an agent's system_prompt in memory (class-level attribute)."""
+    from app.agents.compression import CompressionAgent
+    from app.agents.critique import CritiqueAgent
+    from app.agents.decomposition import DecompositionAgent
+    from app.agents.rag import RAGAgent
+    from app.agents.synthesis import SynthesisAgent
+
+    agent_map = {
+        "decomposition": DecompositionAgent,
+        "rag": RAGAgent,
+        "critique": CritiqueAgent,
+        "synthesis": SynthesisAgent,
+        "compression": CompressionAgent,
+    }
+    cls = agent_map.get(agent_id)
+    if cls:
+        cls.system_prompt = new_prompt
+        logger.info("Patched system_prompt for agent=%s in memory.", agent_id)
+    else:
+        logger.warning("Unknown agent_id=%s — cannot patch prompt.", agent_id)
+
+
+async def _apply_approved_rewrites() -> None:
+    """Load all approved rewrites from DB and patch agent prompts."""
+    from sqlalchemy import select
+
+    from app.database import AsyncSessionLocal
+    from app.models.prompt_rewrite import PromptRewrite as PromptRewriteModel
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(PromptRewriteModel).where(PromptRewriteModel.status == "approved")
+        )
+        rewrites = result.scalars().all()
+
+    for rw in rewrites:
+        _patch_agent_prompt(rw.target_agent, rw.new_prompt)
+
+    if rewrites:
+        logger.info("Applied %d approved prompt rewrite(s).", len(rewrites))

@@ -18,8 +18,5 @@ celery_app.conf.update(
     enable_utc=True,
 )
 
-
-@celery_app.task
-def example_task(message: str) -> dict:
-    """Placeholder task to verify worker is running."""
-    return {"status": "ok", "message": message}
+# Auto-discover tasks in app.worker.tasks
+celery_app.autodiscover_tasks(["app.worker"])
