@@ -178,5 +178,5 @@ curl http://localhost:8000/eval/latest
 | `openai.AuthenticationError` | Missing or invalid `OPENROUTER_API_KEY` | Check `.env` — key must start with `sk-or-` |
 | `alembic.util.exc.CommandError: Can't locate revision` | Migrations not run | Run `alembic upgrade head` |
 | `ModuleNotFoundError: No module named 'app'` | Virtual environment not activated or wrong working directory | Activate venv and run from project root |
-| `asyncpg.InvalidCatalogNameError: database "weave" does not exist` | `.env` defaults don't match `config.py` defaults | Set `POSTGRES_DB=megaai` in `.env` (matches `.env.example`) |
+| `asyncpg.InvalidCatalogNameError: database "weave" does not exist` | Postgres not initialized with correct DB name | Ensure `POSTGRES_DB=weave` in `.env` (matches `.env.example` and `config.py` defaults) |
 | `celery.exceptions.NotRegistered` | Worker not discovering tasks | Ensure you run celery with `-A app.worker:celery_app` |

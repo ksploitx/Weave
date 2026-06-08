@@ -114,9 +114,9 @@ docker compose up
 | `OPENROUTER_API_KEY` | **Yes** | — | Your OpenRouter API key |
 | `OPENROUTER_MODEL` | No | `meta-llama/llama-3.1-8b-instruct:free` | Primary LLM model |
 | `OPENROUTER_FALLBACK_MODEL` | No | `mistralai/mistral-7b-instruct:free` | Fallback if primary fails |
-| `POSTGRES_USER` | No | `megaai` | Postgres username |
-| `POSTGRES_PASSWORD` | No | `megaai` | Postgres password |
-| `POSTGRES_DB` | No | `megaai` | Postgres database name |
+| `POSTGRES_USER` | No | `weave` | Postgres username |
+| `POSTGRES_PASSWORD` | No | `weave` | Postgres password |
+| `POSTGRES_DB` | No | `weave` | Postgres database name |
 | `POSTGRES_HOST` | No | `db` | Postgres host (Docker service name) |
 | `POSTGRES_PORT` | No | `5432` | Postgres port |
 | `REDIS_URL` | No | `redis://redis:6379/0` | Redis URL for Celery broker |
@@ -166,7 +166,6 @@ The evaluation harness runs 15 test cases through the full orchestration pipelin
 - **Eval scoring is heuristic** for ambiguous/adversarial cases — keyword matching, not ground-truth comparison
 - **Meta-agent prompt rewrites are LLM-generated** — plausible but not guaranteed to improve scores
 - **No authentication on any endpoint** — all routes are publicly accessible
-- **`.env.example` defaults** (`megaai`) don't match `config.py` defaults (`weave`) — can cause confusion on first setup without Docker
 - **No rate limiting** on the API — a flood of `/query` requests will exhaust LLM budget
 
 ---
