@@ -13,49 +13,25 @@ Weave is a multi-agent orchestration system that decomposes complex queries acro
 
 ## 🏗️ Architecture
 
-```
-                          +---------------------------+
-                          |    FastAPI  (port 8000)    |
-  +--------+              |  POST /query (SSE stream)  |            +---------+
-  | Client | ----------> |  GET  /jobs/{id}/trace      | ---------> | Celery  |
-  +--------+              |  POST /eval/run             |            | Worker  |
-                          |  GET  /eval/latest          |            +---------+
-                          |  POST /prompt-rewrites/review|               |
-                          |  POST /eval/re-run-failed   |               |
-                          +-------------+---------------+               |
-                                        |                               |
-                                        v                               |
-                          +----------------------------+                |
-                          |   LangGraph Orchestrator    |                |
-                          |  (StateGraph + dynamic      |                |
-                          |   routing function)         |                |
-                          +--+-----+-----+-----+----+--+                |
-                             |     |     |     |    |                   |
-              +--------------+     |     |     |    +----------+       |
-              v                    v     |     v               v       |
-       +--------------+  +------+ |  +----------+  +-------------+    |
-       | Decomposition|  | RAG  | |  | Critique |  | Compression |    |
-       | budget: 1200 |  | 2000 | |  |   1500   |  |    800      |    |
-       +--------------+  +--+---+ |  +----------+  +-------------+    |
-                            |     |                                    |
-                         +--+--+  |                                    |
-                         |FAISS|  v                                    |
-                         +-----+  +-----------+                        |
-                                  | Synthesis |                        |
-                                  |   1500    |                        |
-                                  +-----------+                        |
-                                        |                              |
-         +------------------------------v----------------------------+ |
-         |                   SharedContext (in-memory)                | |
-         |  sub_tasks | agent_outputs | contradictions | provenance  | |
-         +------+----------+----------+----------+----------+-------+ |
-                |          |          |          |          |           |
-                v          v          v          v          v           v
-          +----------+ +-------+ +-----------+ +-------+ +----------+
-          |PostgreSQL| | Redis | |OpenRouter | | Tools | | Log UI   |
-          | 5 tables | |Celery | |  (LLM)    | |  x4   | | port 8080|
-          +----------+ +-------+ +-----------+ +-------+ +----------+
-```
+Weave is built around a dynamic orchestration loop that turns a user request into a traceable, multi-step workflow. A FastAPI endpoint accepts the request, the LangGraph orchestrator routes work between specialized agents, and every step is logged and persisted for inspection or re-evaluation.
+
+![Weave architecture diagram](docs/weave_architecture_clean.svg)
+
+### Core pieces
+
+- API layer: FastAPI exposes streaming query endpoints and job/eval management routes.
+- Orchestrator: LangGraph state machine decides the next step dynamically based on context, budget state, and agent outputs.
+- Agents: decomposition, RAG, critique, synthesis, compression, and meta agents collaborate through a shared context object rather than direct hand-offs.
+- Tools: web search, SQL lookup, code sandbox, and self-reflection components add retrieval and reasoning capabilities.
+- Evaluation loop: the system runs curated eval cases, scores outcomes, and proposes prompt improvements for human review.
+
+### Design goals
+
+- Traceable execution: every agent and tool call is recorded with provenance.
+- Budget-aware routing: compression is inserted automatically when token budgets are exceeded.
+- Human-in-the-loop improvement: eval failures can lead to reviewed prompt rewrites.
+
+For a deeper technical walkthrough, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
